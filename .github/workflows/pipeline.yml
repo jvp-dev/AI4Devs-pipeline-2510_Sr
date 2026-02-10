@@ -1,20 +1,18 @@
-name: CI/CD Pipeline
+name: Backend Pipeline
 
 on:
-  push:
-    branches: [main]
   pull_request:
-    branches: [main]
+    types: [opened, synchronize, reopened]
 
 env:
   NODE_VERSION: '18'
 
 jobs:
   # ============================================
-  # Backend: Build and Test
+  # Step 1: Backend Tests
   # ============================================
-  build-and-test-backend:
-    name: Backend - Build & Test
+  test-backend:
+    name: Backend - Tests
     runs-on: ubuntu-latest
 
     defaults:
@@ -38,29 +36,20 @@ jobs:
       - name: Generate Prisma Client
         run: npx prisma generate
 
-      - name: Build
-        run: npm run build
-
       - name: Run tests
         run: npm test
 
-      - name: Upload backend build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: backend-dist
-          path: backend/dist
-          retention-days: 1
-
   # ============================================
-  # Frontend: Build
+  # Step 2: Backend Build
   # ============================================
-  build-frontend:
-    name: Frontend - Build
+  build-backend:
+    name: Backend - Build
     runs-on: ubuntu-latest
+    needs: [test-backend]
 
     defaults:
       run:
-        working-directory: ./frontend
+        working-directory: ./backend
 
     steps:
       - name: Checkout code
@@ -71,29 +60,31 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
-          cache-dependency-path: frontend/package-lock.json
+          cache-dependency-path: backend/package-lock.json
 
       - name: Install dependencies
         run: npm ci
 
-      - name: Build
+      - name: Generate Prisma Client
+        run: npx prisma generate
+
+      - name: Build backend
         run: npm run build
 
-      - name: Upload frontend build artifact
+      - name: Upload backend build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: frontend-build
-          path: frontend/build
+          name: backend-dist
+          path: backend/dist
           retention-days: 1
 
   # ============================================
-  # Deploy to EC2
+  # Step 3: Deploy Backend to EC2
   # ============================================
-  deploy:
-    name: Deploy to EC2
+  deploy-backend:
+    name: Deploy Backend to EC2
     runs-on: ubuntu-latest
-    needs: [build-and-test-backend, build-frontend]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: [build-backend]
 
     steps:
       - name: Checkout code
@@ -105,17 +96,11 @@ jobs:
           name: backend-dist
           path: backend/dist
 
-      - name: Download frontend artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: frontend-build
-          path: frontend/build
-
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_ACCESS_KEY }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-1
 
       - name: Create deployment package
@@ -125,13 +110,12 @@ jobs:
           cp -r backend/prisma deploy/prisma
           cp backend/package.json deploy/
           cp backend/package-lock.json deploy/
-          cp -r frontend/build deploy/frontend-build
           tar -czvf deploy.tar.gz deploy
 
       - name: Copy files to EC2
         uses: appleboy/scp-action@v0.1.7
         with:
-          host: ${{ secrets.EC2_INSTANCE }}
+          host: ${{ secrets.EC2_HOST }}
           username: ec2-user
           key: ${{ secrets.EC2_SSH_KEY }}
           source: "deploy.tar.gz"
@@ -140,7 +124,7 @@ jobs:
       - name: Deploy on EC2
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ secrets.EC2_INSTANCE }}
+          host: ${{ secrets.EC2_HOST }}
           username: ec2-user
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
@@ -154,14 +138,12 @@ jobs:
             npm ci --production
             npx prisma generate
 
-            # Stop existing PM2 processes
-            pm2 stop all || true
+            # Stop existing backend process
+            pm2 stop lti-backend || true
+            pm2 delete lti-backend || true
 
             # Start backend with PM2
             pm2 start backend-dist/index.js --name "lti-backend"
-
-            # Serve frontend with PM2 (using serve or nginx)
-            pm2 serve frontend-build 3000 --name "lti-frontend" --spa
 
             # Save PM2 configuration
             pm2 save
@@ -170,4 +152,4 @@ jobs:
             cd /home/ec2-user
             rm -f deploy.tar.gz
 
-            echo "Deployment completed successfully!"
+            echo "Backend deployment completed successfully!"
